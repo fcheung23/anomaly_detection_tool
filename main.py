@@ -1,3 +1,3 @@
-from anomaly_detection.detector import detect
+from anomaly_detection.pipeline import load_data
 
-detect("test data")
+df = load_data("hh103.csv")
