@@ -3,14 +3,29 @@ from anomaly_detection.detector import AnomalyDetector
 detector = AnomalyDetector("hh103.csv")
 results = detector.analyze()
 
-print("\n--- Duration summary ---")
-print(results["duration_summary"].to_string(index=False))
+def fmt_timestamps(df, cols):
+    df = df.copy()
+    for col in cols:
+        if col in df.columns:
+            df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M")
+    return df
 
-print("\n--- House-wide silences (excluded from scoring) ---")
-print(results["housewide_silences"].to_string(index=False))
+n_absences = len(results["housewide_silences"])
+n_gaps = len(results["idle_gaps"])
+n_absent = len(results["absent_firing"])
 
-print("\n--- Idle gaps (individual sensors) ---")
-print(results["idle_gaps"].sort_values("idle_seconds", ascending=False).to_string(index=False))
+print(f"\n--- Likely home absences ({n_absences}) ---")
+df = fmt_timestamps(results["housewide_silences"], ["started_at", "ended_at"])
+print(df.to_string(index=False))
 
-print("\n--- Severity scores ---")
-print(results["severity_scores"].to_string(index=False))
+# print("\n--- Home absence breakdown (individual sensors) ---")
+# print(results["housewide_gaps"].sort_values("silence_start").to_string(index=False))
+
+print(f"\n--- Idle gaps, not during home absence ({n_gaps}) ---")
+df = fmt_timestamps(results["idle_gaps"], ["silence_start", "silence_end"]).drop(columns=["idle_seconds"])
+print(df.sort_values("silence_start").to_string(index=False))
+
+print(f"\n--- Sensors firing during home absences ({n_absent}) ---")
+for started_at, group in results["absent_firing"].groupby("silence_start"):
+    print(f"\nabsence: {started_at.strftime('%Y-%m-%d %H:%M')}")
+    print(group.drop(columns=["silence_start"]).sort_values("fires", ascending=False).to_string(index=False))

@@ -2,21 +2,17 @@ import json
 import os
 import pandas as pd
 import copy
-from anomaly_detection.pipeline import load_data, compute_sessions
+from anomaly_detection.pipeline import load_data
 
 
 def format_duration(seconds: float) -> str:
     seconds = int(seconds)
-
     days = seconds // 86400
     seconds %= 86400
-
     hours = seconds // 3600
     seconds %= 3600
-
     minutes = seconds // 60
     seconds %= 60
-
     if days > 0:
         return f"{days}d {hours}h {minutes}m {seconds}s"
     if hours > 0:
@@ -27,23 +23,12 @@ def format_duration(seconds: float) -> str:
 
 
 DEFAULT_CONFIG = {
-    "duration_bounds": {
-        "default":     {"min": 2,  "max": 3 * 24 * 60 * 60},
-        "Bathroom":    {"min": 30, "max": 2 * 60 * 60},
-        "Bedroom":     {"min": 30, "max": 12 * 60 * 60},
-        "LivingRoom":  {"min": 5,  "max": 4 * 60 * 60},
-        "Kitchen":     {"min": 5,  "max": 3 * 60 * 60},
-        "Chair":       {"min": 2,  "max": 4 * 60 * 60},
-    },
-
     "idle_gap": {
-        "threshold_seconds": 7 * 24 * 60 * 60,
-        "housewide_window_minutes": 120,
-        "housewide_sensor_ratio": 0.5
-    },
-
-    "severity": {
-        "noise_ratio_threshold": 0.3,
+        "threshold_seconds": 3 * 24 * 60 * 60,
+        "housewide_window_minutes": 1440,
+        "housewide_sensor_ratio": 0.8,
+        "return_sensor_ratio": 0.4,
+        "return_window_minutes": 60,
     }
 }
 
@@ -59,181 +44,155 @@ def deep_update(base, updates):
 
 def load_config(user_config=None):
     config = copy.deepcopy(DEFAULT_CONFIG)
-
     if os.path.exists("config.json"):
         with open("config.json") as f:
-            file_config = json.load(f)
-            config = deep_update(config, file_config)
-
+            config = deep_update(config, json.load(f))
     if user_config:
         config = deep_update(config, user_config)
-
     return config
 
 
 class AnomalyDetector:
     def __init__(self, filepath, config=None):
-        print("Loading data...")
+        print("=== Loading data ===")
         self.df = load_data(filepath)
-        print("✔ Data loaded")
-
-        print("Computing sessions...")
-        self.sessions = compute_sessions(self.df)
-        print("✔ Sessions computed")
-
+        self.df = self.df.sort_values("timestamp").reset_index(drop=True)
         self.config = load_config(config)
+        self.total_sensors = self.df["sensor"].nunique()
 
-    def analyze_duration(self):
-        cfg = self.config["duration_bounds"]
-        results = []
+    def find_housewide_silence_end(self, housewide_silence_confirmed_at):
+        cfg = self.config["idle_gap"]
+        return_window = pd.Timedelta(minutes=cfg["return_window_minutes"])
+        return_ratio = cfg["return_sensor_ratio"]
+        scan_from = housewide_silence_confirmed_at + pd.Timedelta(seconds=cfg["threshold_seconds"])
 
-        print("Running duration analysis...")
+        after = self.df[self.df["timestamp"] > scan_from].reset_index(drop=True)
 
-        for sensor, group in self.sessions.groupby("sensor"):
-            rules = cfg.get(sensor, cfg["default"])
-            total = len(group)
+        for idx, row in after.iterrows():
+            window_events = after[
+                (after["timestamp"] >= row["timestamp"]) &
+                (after["timestamp"] <= row["timestamp"] + return_window)
+            ]
+            if window_events["sensor"].nunique() >= (self.total_sensors * return_ratio):
+                return row["timestamp"]
 
-            noise_sessions = group[group["duration_seconds"] < rules["min"]]
-            long_sessions = group[group["duration_seconds"] > rules["max"]]
+        return self.df["timestamp"].max()
 
-            noise_ratio = round(len(noise_sessions) / total, 3) if total > 0 else 0
-            long_ratio = round(len(long_sessions) / total, 3) if total > 0 else 0
-
-            results.append({
-                "sensor": sensor,
-                "total_sessions": total,
-                "noise_sessions": len(noise_sessions),
-                "noise_ratio": noise_ratio,
-                "long_sessions": len(long_sessions),
-                "long_ratio": long_ratio,
-            })
-
-        print("\n✔ Duration analysis complete")
-        return pd.DataFrame(results)
-
-    def detect_housewide_silence(self, idle_gaps):
+    def detect_housewide_silence(self, gaps):
         cfg = self.config["idle_gap"]
         window_minutes = cfg["housewide_window_minutes"]
         sensor_ratio = cfg["housewide_sensor_ratio"]
-        total_sensors = self.sessions["sensor"].nunique()
+        window_delta = pd.Timedelta(minutes=window_minutes)
 
-        idle_gaps = idle_gaps.sort_values("start").copy()
-        idle_gaps["gap_start"] = pd.to_datetime(idle_gaps["start"])
+        gaps = gaps.sort_values("silence_start").copy()
 
-        housewide_flags = []
-        housewide_events = []
-        seen_windows = []
+        # Pass 1: sweep forward to find clusters of sensors going silent together
+        housewide_silence_anchors = []
+        for idx, row in gaps.iterrows():
+            if any(
+                row["silence_start"] >= anchor and row["silence_start"] <= anchor + window_delta
+                for anchor in housewide_silence_anchors
+            ):
+                continue
 
-        for idx, row in idle_gaps.iterrows():
-            window_start = row["gap_start"] - pd.Timedelta(minutes=window_minutes)
-            window_end = row["gap_start"] + pd.Timedelta(minutes=window_minutes)
-
-            nearby = idle_gaps[
-                (idle_gaps["gap_start"] >= window_start) &
-                (idle_gaps["gap_start"] <= window_end)
+            cluster = gaps[
+                (gaps["silence_start"] >= row["silence_start"]) &
+                (gaps["silence_start"] <= row["silence_start"] + window_delta)
             ]
 
-            is_housewide = len(nearby["sensor"].unique()) >= (total_sensors * sensor_ratio)
-            housewide_flags.append(is_housewide)
+            if len(cluster["sensor"].unique()) >= (self.total_sensors * sensor_ratio):
+                housewide_silence_anchors.append(row["silence_start"])
 
-            if is_housewide:
-                already_seen = any(
-                    abs((row["gap_start"] - seen).total_seconds()) < window_minutes * 60
-                    for seen in seen_windows
-                )
-                if not already_seen:
-                    seen_windows.append(row["gap_start"])
-                    housewide_events.append({
-                        "date": row["gap_start"].date(),
-                        "started_at": row["gap_start"],
-                        "sensors_affected": len(nearby["sensor"].unique()),
-                        "idle_time": format_duration(nearby["idle_seconds"].max())
-                    })
+        # Pass 2: mark any gap within ±window of any anchor as housewide
+        def in_housewide_window(silence_start):
+            return any(
+                abs((silence_start - anchor).total_seconds()) < window_minutes * 60
+                for anchor in housewide_silence_anchors
+            )
 
-        idle_gaps["housewide"] = housewide_flags
-        return idle_gaps, pd.DataFrame(housewide_events)
+        gaps["housewide"] = gaps["silence_start"].apply(in_housewide_window)
+
+        # Build housewide events
+        housewide_events = []
+        for anchor in housewide_silence_anchors:
+            cluster = gaps[
+                (gaps["silence_start"] >= anchor - window_delta) &
+                (gaps["silence_start"] <= anchor + window_delta)
+            ]
+            housewide_silence_start = cluster["silence_start"].min()
+            housewide_silence_confirmed_at = cluster["silence_start"].max()
+            housewide_silence_end = self.find_housewide_silence_end(housewide_silence_confirmed_at)
+            duration = (housewide_silence_end - housewide_silence_start).total_seconds()
+
+            housewide_events.append({
+                "started_at": housewide_silence_start,
+                "ended_at": housewide_silence_end,
+                "sensors_affected": len(cluster["sensor"].unique()),
+                "idle_time": format_duration(duration),
+                "cluster_sensors": set(cluster["sensor"].unique()),
+            })
+
+        return gaps, pd.DataFrame(housewide_events)
 
     def analyze_idle_gaps(self):
         cfg = self.config["idle_gap"]
         results = []
 
-        print("Running idle gap analysis...")
-
-        for sensor, group in self.sessions.groupby("sensor"):
-            group = group.sort_values("start")
-
-            gaps = group["start"].diff().dt.total_seconds()
+        for sensor, group in self.df.groupby("sensor"):
+            group = group.reset_index(drop=True)
+            gaps = group["timestamp"].diff().dt.total_seconds()
             long_gaps = gaps[gaps > cfg["threshold_seconds"]]
 
             for idx, gap in long_gaps.items():
                 results.append({
                     "sensor": sensor,
-                    "start": group.loc[idx, "start"],
+                    "silence_start": group.loc[idx - 1, "timestamp"],
+                    "silence_end": group.loc[idx, "timestamp"],
                     "idle_seconds": float(gap),
                     "idle_time": format_duration(gap)
                 })
 
         if results:
-            idle_gaps = pd.DataFrame(results)
-            idle_gaps, housewide_events = self.detect_housewide_silence(idle_gaps)
-            sensor_gaps = idle_gaps[~idle_gaps["housewide"]].drop(columns=["housewide", "gap_start"])
-            print(f"  {len(housewide_events)} house-wide silence events detected")
-            print(f"  {len(sensor_gaps)} individual sensor gaps remaining")
+            gaps = pd.DataFrame(results)
+            gaps, housewide_events = self.detect_housewide_silence(gaps)
+            sensor_gaps = gaps[~gaps["housewide"]].drop(columns=["housewide"])
+            housewide_gaps = gaps[gaps["housewide"]].drop(columns=["housewide"])
         else:
             sensor_gaps = pd.DataFrame()
+            housewide_gaps = pd.DataFrame()
             housewide_events = pd.DataFrame()
 
-        print("✔ Idle gap analysis complete")
-        return sensor_gaps, housewide_events
+        return sensor_gaps, housewide_gaps, housewide_events
 
-    def compute_severity_score(self, duration, idle_gaps):
-        cfg = self.config["severity"]
-        sensors = self.sessions["sensor"].unique()
+    def detect_absent_firing(self, housewide_silences):
         results = []
 
-        max_idle = idle_gaps["idle_seconds"].max() if len(idle_gaps) > 0 else 1
-        sensor_max_idle = idle_gaps.groupby("sensor")["idle_seconds"].max() if len(idle_gaps) > 0 else pd.Series(dtype=float)
+        for _, silence in housewide_silences.iterrows():
+            during = self.df[
+                (self.df["timestamp"] > silence["started_at"]) &
+                (self.df["timestamp"] < silence["ended_at"]) &
+                (~self.df["sensor"].isin(silence["cluster_sensors"]))
+            ]
 
-        for sensor in sensors:
-            flags = []
-            score = 0.0
+            if len(during) == 0:
+                continue
 
-            sensor_rows = duration[duration["sensor"] == sensor]
-            if len(sensor_rows) == 0:
-                continue  # skip safely (no change in scoring logic for valid rows)
+            counts = during.groupby("sensor").size().reset_index(name="fires")
+            counts["silence_start"] = silence["started_at"]
+            results.append(counts)
 
-            row = sensor_rows.iloc[0]
-            noise_ratio = row["noise_ratio"]
-
-            if noise_ratio > cfg["noise_ratio_threshold"]:
-                flags.append("high_noise_ratio")
-            score += noise_ratio * 0.3
-
-            if sensor in sensor_max_idle.index:
-                flags.append("idle_gaps")
-                score += sensor_max_idle[sensor] / max_idle
-
-            results.append({
-                "sensor": sensor,
-                "severity_score": round(score, 3),
-                "flags": ", ".join(flags) if flags else "none"
-            })
-
-        return pd.DataFrame(results).sort_values("severity_score", ascending=False).reset_index(drop=True)
+        if results:
+            return pd.concat(results, ignore_index=True)
+        return pd.DataFrame()
 
     def analyze(self):
         print("\n=== Starting anomaly analysis ===")
-
-        duration = self.analyze_duration()
-        idle_gaps, housewide_silences = self.analyze_idle_gaps()
-        severity = self.compute_severity_score(duration, idle_gaps)
-
-        results = {
-            "duration_summary": duration,
-            "idle_gaps": idle_gaps,
+        sensor_gaps, housewide_gaps, housewide_silences = self.analyze_idle_gaps()
+        absent_firing = self.detect_absent_firing(housewide_silences)
+        print("✔ Analysis complete\n")
+        return {
+            "idle_gaps": sensor_gaps,
+            "housewide_gaps": housewide_gaps,
             "housewide_silences": housewide_silences,
-            "severity_scores": severity
+            "absent_firing": absent_firing,
         }
-
-        print("✔ All analysis complete\n")
-        return results
