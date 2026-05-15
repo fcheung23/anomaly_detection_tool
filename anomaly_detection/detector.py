@@ -24,10 +24,10 @@ def format_duration(seconds: float) -> str:
 
 DEFAULT_CONFIG = {
     "idle_gap": {
-        "threshold_seconds": 3 * 24 * 60 * 60,
+        "threshold_seconds": 24 * 60 * 60,
         "housewide_window_minutes": 1440,
         "housewide_sensor_ratio": 0.8,
-        "return_sensor_ratio": 0.4,
+        "return_sensor_ratio": 0.3,
         "return_window_minutes": 60,
     }
 }
@@ -59,6 +59,10 @@ class AnomalyDetector:
         self.df = self.df.sort_values("timestamp").reset_index(drop=True)
         self.config = load_config(config)
         self.total_sensors = self.df["sensor"].nunique()
+
+    def configure(self, updates):
+        self.config = deep_update(self.config, updates)
+        return self
 
     def find_housewide_silence_end(self, housewide_silence_confirmed_at):
         cfg = self.config["idle_gap"]
